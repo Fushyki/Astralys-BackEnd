@@ -18,6 +18,8 @@ if not DATABASE_URL:
     senha_codificada = quote_plus(MYSQL_PASSWORD)
     DATABASE_URL = f"mysql+pymysql://{MYSQL_USER}:{senha_codificada}@{MYSQL_HOST}:{MYSQL_PORT}/{MYSQL_DB}"
 
+DATABASE_URL = DATABASE_URL.strip()
+
 # Ajuste caso o provider envie "mysql://" ou "postgres://" ao invés do driver sqlalchemy
 if DATABASE_URL.startswith("mysql://"):
     DATABASE_URL = DATABASE_URL.replace("mysql://", "mysql+pymysql://", 1)
@@ -25,6 +27,12 @@ elif DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql+psycopg2://", 1)
 elif DATABASE_URL.startswith("postgresql://") and not DATABASE_URL.startswith("postgresql+"):
     DATABASE_URL = DATABASE_URL.replace("postgresql://", "postgresql+psycopg2://", 1)
+
+# Se for Postgres no Render, garante sslmode=require
+if "render.com" in DATABASE_URL and "sslmode" not in DATABASE_URL:
+    sep = "&" if "?" in DATABASE_URL else "?"
+    DATABASE_URL = f"{DATABASE_URL}{sep}sslmode=require"
+
 
 
 engine = create_engine(
