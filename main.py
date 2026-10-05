@@ -1,5 +1,8 @@
+import os
 import uuid
-from fastapi import FastAPI, Depends, HTTPException, status
+import time
+from collections import defaultdict
+from fastapi import FastAPI, Depends, HTTPException, status, Request, Response
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
@@ -16,16 +19,103 @@ Base.metadata.create_all(bind=engine)
 
 app = FastAPI(
     title="Ametist & Astralys - Identity, SSO & Projects Suite",
-    description="Responsável por autenticação SSO JWT, perfis e sincronização de planilhas/projetos do Astralys.",
-    version="2.0.0"
+    description="Responsável por autenticação SSO JWT, perfis e sincronização de planilhas/projetos do Astralys com segurança extrema.",
+    version="2.1.0"
 )
 
-# Habilita CORS para conexão com frontends (Astralys, Ametist Hub, Vercel, localhost)
+# ==========================================
+# 1. RATE LIMITER ANTI-BRUTE FORCE / DDOS
+# ==========================================
+
+class SlidingWindowRateLimiter:
+    """Implementação em memória de janela deslizante para controle estrito de requisições por IP."""
+    def __init__(self):
+        self.history = defaultdict(list)
+
+    def is_allowed(self, ip: str, max_requests: int, window_seconds: int = 60) -> bool:
+        now = time.time()
+        # Filtra apenas requisições dentro da janela temporal
+        self.history[ip] = [t for t in self.history[ip] if now - t < window_seconds]
+        if len(self.history[ip]) >= max_requests:
+            return False
+        self.history[ip].append(now)
+        return True
+
+auth_rate_limiter = SlidingWindowRateLimiter()
+general_rate_limiter = SlidingWindowRateLimiter()
+
+# ==========================================
+# 2. MIDDLEWARE DE HEADERS DE SEGURANÇA E RATE LIMIT
+# ==========================================
+
+@app.middleware("http")
+async def security_and_rate_limit_middleware(request: Request, call_next):
+    # Identifica IP real (considerando proxies do Render / Cloudflare)
+    forwarded = request.headers.get("x-forwarded-for")
+    client_ip = forwarded.split(",")[0].strip() if forwarded else (request.client.host if request.client else "unknown")
+
+    path = request.url.path
+    method = request.method
+
+    # Ignora pre-flight CORS OPTIONS
+    if method != "OPTIONS":
+        # Limite estrito de 6 tentativas por minuto para rotas sensíveis de autenticação
+        if path in ("/auth/login", "/auth/register", "/auth/alterar-senha"):
+            if not auth_rate_limiter.is_allowed(client_ip, max_requests=6, window_seconds=60):
+                return Response(
+                    content='{"detail": "Muitas tentativas de autenticação detectadas. Por segurança, aguarde 60 segundos antes de tentar novamente."}',
+                    status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                    media_type="application/json",
+                    headers={"Retry-After": "60"}
+                )
+        else:
+            # Limite geral de 150 requisições por minuto para mitigação de scraping / DDoS
+            if not general_rate_limiter.is_allowed(client_ip, max_requests=150, window_seconds=60):
+                return Response(
+                    content='{"detail": "Limite de requisições excedido. Reduza a frequência de chamadas."}',
+                    status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                    media_type="application/json",
+                    headers={"Retry-After": "30"}
+                )
+
+    response = await call_next(request)
+
+    # Injeta Headers HTTP de Segurança Máxima (OWASP Compliant)
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["X-XSS-Protection"] = "1; mode=block"
+    response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains; preload"
+    response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+    response.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()"
+
+    return response
+
+# ==========================================
+# 3. CORS BLINDADO (ORIGENS AUTORIZADAS)
+# ==========================================
+
+ALLOWED_ORIGINS = [
+    "https://astralys.onrender.com",
+    "https://astralys-api.onrender.com",
+    "https://ametist-tier-maker.vercel.app",
+    "http://localhost:5173",
+    "http://localhost:5174",
+    "http://127.0.0.1:5173",
+    "http://127.0.0.1:5174",
+]
+
+env_origins = os.getenv("ALLOWED_ORIGINS")
+if env_origins:
+    for o in env_origins.split(","):
+        clean_o = o.strip()
+        if clean_o and clean_o not in ALLOWED_ORIGINS:
+            ALLOWED_ORIGINS.append(clean_o)
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=ALLOWED_ORIGINS,
     allow_credentials=True,
-    allow_methods=["*"],
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
     allow_headers=["*"],
 )
 
@@ -130,9 +220,11 @@ def registrar_usuario(dados: schemas.UsuarioCreate, db: Session = Depends(get_db
 
 @app.post("/auth/login", response_model=schemas.TokenResponse, tags=["Autenticação"])
 def login(dados: schemas.LoginRequest, db: Session = Depends(get_db)):
-    """Valida credenciais, gera token JWT e grava a sessão ativa no banco."""
+    """Valida credenciais, gera token JWT e grava a sessão ativa no banco com proteção a Timing Attacks."""
     usuario = db.query(models.Usuario).filter(models.Usuario.email == dados.email).first()
     if not usuario or not usuario.credencial:
+        # Mitigação contra Timing Attack: consome exatamente o mesmo tempo de processamento
+        security.verify_dummy_password(dados.senha)
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="E-mail ou senha incorretos."
