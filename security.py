@@ -1,6 +1,8 @@
 import os
 import re
 import html
+import time
+import uuid
 import bcrypt
 import jwt
 import hashlib
@@ -51,7 +53,7 @@ def validate_password_strength(password: str) -> None:
         raise ValueError("A senha deve conter pelo menos uma letra minúscula.")
     if not re.search(r"[0-9]", password):
         raise ValueError("A senha deve conter pelo menos um número.")
-    if not re.search(r"[!@#$%^&*(),.?\":{}|<>\-_+=\\/\\[\\]]", password):
+    if not re.search(r"[^a-zA-Z0-9\s]", password):
         raise ValueError("A senha deve conter pelo menos um caractere especial (!@#$%^&*...).")
 
 
@@ -126,3 +128,36 @@ def decode_access_token(token: str) -> Optional[dict]:
         return payload
     except jwt.PyJWTError:
         return None
+
+
+# ==========================================
+# GESTÃO DE TICKETS SSO DE USO ÚNICO (EPHEMERAL)
+# ==========================================
+
+_sso_tickets = {}
+
+def create_sso_ticket(user_id: str, lifetime_seconds: int = 60) -> str:
+    """Gera um ticket efêmero criptograficamente seguro e de uso único para SSO."""
+    now = time.time()
+    # Limpeza proativa de tickets expirados
+    expired = [k for k, v in _sso_tickets.items() if v["expires_at"] < now]
+    for k in expired:
+        _sso_tickets.pop(k, None)
+
+    ticket = f"sso_{uuid.uuid4().hex}"
+    _sso_tickets[ticket] = {
+        "user_id": user_id,
+        "expires_at": now + lifetime_seconds
+    }
+    return ticket
+
+
+def consume_sso_ticket(ticket: str) -> Optional[str]:
+    """Valida e consome imediatamente o ticket de SSO, prevenindo ataques de replay."""
+    now = time.time()
+    data = _sso_tickets.pop(ticket, None)
+    if not data:
+        return None
+    if data["expires_at"] < now:
+        return None
+    return data["user_id"]

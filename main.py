@@ -60,7 +60,7 @@ async def security_and_rate_limit_middleware(request: Request, call_next):
     # Ignora pre-flight CORS OPTIONS
     if method != "OPTIONS":
         # Limite estrito de 6 tentativas por minuto para rotas sensíveis de autenticação
-        if path in ("/auth/login", "/auth/register", "/auth/alterar-senha"):
+        if path in ("/auth/login", "/auth/register", "/auth/alterar-senha", "/auth/sso/exchange", "/auth/sso/ticket"):
             if not auth_rate_limiter.is_allowed(client_ip, max_requests=6, window_seconds=60):
                 return Response(
                     content='{"detail": "Muitas tentativas de autenticação detectadas. Por segurança, aguarde 60 segundos antes de tentar novamente."}',
@@ -306,6 +306,57 @@ def solicitar_recuperacao_senha(email: str, db: Session = Depends(get_db)):
     usuario = db.query(models.Usuario).filter(models.Usuario.email == email).first()
     # Por segurança, sempre devolvemos sucesso para não expor se o e-mail existe ou não
     return {"mensagem": f"Se o e-mail {email} estiver cadastrado, as instruções de recuperação foram enviadas."}
+
+
+# ==========================================
+# ROTAS DE TICKETS SSO ENTRE ASTRALYS & AMETIST
+# ==========================================
+
+@app.post("/auth/sso/ticket", response_model=schemas.SsoTicketResponse, tags=["Autenticação"])
+def gerar_sso_ticket(usuario_atual: models.Usuario = Depends(get_current_user)):
+    """Gera um ticket efêmero (60 segundos) de uso único para SSO entre Astralys e Ametist."""
+    ticket = security.create_sso_ticket(usuario_atual.id, lifetime_seconds=60)
+    return {"ticket": ticket, "expires_in": 60}
+
+
+@app.post("/auth/sso/exchange", response_model=schemas.TokenResponse, tags=["Autenticação"])
+def trocar_sso_ticket(dados: schemas.SsoExchangeRequest, db: Session = Depends(get_db)):
+    """Troca um ticket SSO efêmero e de uso único por uma sessão autenticada com novo JWT."""
+    user_id = security.consume_sso_ticket(dados.ticket)
+    if not user_id:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Ticket SSO inválido, expirado ou já utilizado."
+        )
+
+    usuario = db.query(models.Usuario).filter(models.Usuario.id == user_id).first()
+    if not usuario:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Usuário associado ao ticket não encontrado."
+        )
+
+    # Gera token JWT novo e seguro para a aplicação solicitante
+    token = security.create_access_token(data={"sub": usuario.id, "email": usuario.email})
+
+    # Registra a sessão na tabela sessoes_ativas
+    token_hash = security.hash_token(token)
+    expira_em = datetime.utcnow() + timedelta(minutes=security.ACCESS_TOKEN_EXPIRE_MINUTES)
+    nova_sessao = models.SessaoAtiva(
+        usuario_id=usuario.id,
+        refresh_token_hash=token_hash,
+        expira_em=expira_em,
+        revogado=False
+    )
+    db.add(nova_sessao)
+    db.commit()
+
+    return {
+        "access_token": token,
+        "token_type": "bearer",
+        "usuario": usuario
+    }
+
 
 
 # ==========================================

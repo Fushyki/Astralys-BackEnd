@@ -65,6 +65,13 @@ class TokenResponse(BaseModel):
 class MensagemResponse(BaseModel):
     mensagem: str
 
+class SsoTicketResponse(BaseModel):
+    ticket: str
+    expires_in: int = 60
+
+class SsoExchangeRequest(BaseModel):
+    ticket: str = Field(..., min_length=10, max_length=128, description="Ticket efêmero de uso único")
+
 # ==========================================
 # SCHEMAS DO ASTRALYS (PROJETOS & CÁLCULOS)
 # ==========================================
