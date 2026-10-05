@@ -23,6 +23,18 @@ class LoginRequest(BaseModel):
     email: EmailStr
     senha: str = Field(..., min_length=1, max_length=128)
 
+class OAuthSyncRequest(BaseModel):
+    email: EmailStr = Field(..., description="E-mail validado pelo provedor OAuth (Google)")
+    nome: str = Field(..., min_length=1, max_length=100, description="Nome vindo do perfil Google")
+    avatar_url: Optional[str] = Field(None, max_length=500, description="URL da foto do perfil Google")
+    provider: Optional[str] = Field("google", max_length=50)
+
+    @field_validator('nome')
+    @classmethod
+    def sanitize_oauth_name(cls, v: str) -> str:
+        return security.sanitize_text(v) or v
+
+
 class AlterarSenhaRequest(BaseModel):
     senha_atual: str = Field(..., min_length=1, max_length=128, description="Senha atual para confirmação")
     nova_senha: str = Field(..., min_length=8, max_length=128, description="Nova senha forte")

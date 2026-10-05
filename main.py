@@ -60,7 +60,7 @@ async def security_and_rate_limit_middleware(request: Request, call_next):
     # Ignora pre-flight CORS OPTIONS
     if method != "OPTIONS":
         # Limite estrito de 6 tentativas por minuto para rotas sensíveis de autenticação
-        if path in ("/auth/login", "/auth/register", "/auth/alterar-senha", "/auth/sso/exchange", "/auth/sso/ticket"):
+        if path in ("/auth/login", "/auth/register", "/auth/alterar-senha", "/auth/sso/exchange", "/auth/sso/ticket", "/auth/oauth-sync"):
             if not auth_rate_limiter.is_allowed(client_ip, max_requests=6, window_seconds=60):
                 return Response(
                     content='{"detail": "Muitas tentativas de autenticação detectadas. Por segurança, aguarde 60 segundos antes de tentar novamente."}',
@@ -258,6 +258,68 @@ def login(dados: schemas.LoginRequest, db: Session = Depends(get_db)):
         "token_type": "bearer",
         "usuario": usuario
     }
+
+
+@app.post("/auth/oauth-sync", response_model=schemas.TokenResponse, tags=["Autenticação"])
+def oauth_sync_login(dados: schemas.OAuthSyncRequest, db: Session = Depends(get_db)):
+    """
+    Sincroniza e autentica usuários autenticados via OAuth (Google / Supabase):
+    - Cria a conta automaticamente caso seja o primeiro acesso com o Google.
+    - Se a conta já existir, sincroniza o nome e o avatar oficial do Google.
+    - Emite token JWT oficial do ecossistema e grava a sessão no banco para SSO unificado.
+    """
+    usuario = db.query(models.Usuario).filter(models.Usuario.email == dados.email).first()
+    if not usuario:
+        usuario = models.Usuario(
+            email=dados.email,
+            nome=dados.nome or dados.email.split('@')[0],
+            avatar_url=dados.avatar_url
+        )
+        db.add(usuario)
+        db.flush()
+
+        # Cria credencial técnica para contas federadas
+        dummy_cred = models.Credencial(
+            usuario_id=usuario.id,
+            senha_hash=security.hash_password(f"oauth_{uuid.uuid4().hex}!Aa1")
+        )
+        db.add(dummy_cred)
+        db.commit()
+        db.refresh(usuario)
+    else:
+        # Atualiza avatar ou nome do perfil se recebido do Google
+        changed = False
+        if dados.avatar_url and not usuario.avatar_url:
+            usuario.avatar_url = dados.avatar_url
+            changed = True
+        if dados.nome and usuario.nome != dados.nome and len(dados.nome) > 1:
+            usuario.nome = dados.nome
+            changed = True
+        if changed:
+            db.commit()
+            db.refresh(usuario)
+
+    # Gera token JWT com expiração e claims seguros
+    token = security.create_access_token(data={"sub": usuario.id, "email": usuario.email})
+
+    # Registra a sessão ativa na tabela sessoes_ativas
+    token_hash = security.hash_token(token)
+    expira_em = datetime.utcnow() + timedelta(minutes=security.ACCESS_TOKEN_EXPIRE_MINUTES)
+    nova_sessao = models.SessaoAtiva(
+        usuario_id=usuario.id,
+        refresh_token_hash=token_hash,
+        expira_em=expira_em,
+        revogado=False
+    )
+    db.add(nova_sessao)
+    db.commit()
+
+    return {
+        "access_token": token,
+        "token_type": "bearer",
+        "usuario": usuario
+    }
+
 
 
 @app.post("/auth/logout", response_model=schemas.MensagemResponse, tags=["Autenticação"])
