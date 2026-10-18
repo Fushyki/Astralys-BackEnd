@@ -1,7 +1,20 @@
+import json
 from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator
 from datetime import datetime
 from typing import Optional, Dict, Any, List
 import security
+
+MAX_PROJECT_JSON_BYTES = 1_000_000  # ~1 MB por projeto
+MAX_SYNC_ITEMS = 100
+
+
+def _validate_https_url(v: Optional[str]) -> Optional[str]:
+    """Aceita apenas URLs http(s); bloqueia esquemas como javascript: ou data:."""
+    if v is None or v == "":
+        return v
+    if not (v.startswith("https://") or v.startswith("http://")):
+        raise ValueError("A URL deve começar com http:// ou https://.")
+    return v
 
 class UsuarioCreate(BaseModel):
     nome: str = Field(..., min_length=2, max_length=100, description="Nome do usuário")
@@ -24,15 +37,20 @@ class LoginRequest(BaseModel):
     senha: str = Field(..., min_length=1, max_length=128)
 
 class OAuthSyncRequest(BaseModel):
-    email: EmailStr = Field(..., description="E-mail validado pelo provedor OAuth (Google)")
-    nome: str = Field(..., min_length=1, max_length=100, description="Nome vindo do perfil Google")
+    """O e-mail NÃO vem daqui: é lido do token do provedor (verificado no servidor)."""
+    nome: Optional[str] = Field(None, min_length=1, max_length=100, description="Nome do perfil Google (opcional)")
     avatar_url: Optional[str] = Field(None, max_length=500, description="URL da foto do perfil Google")
     provider: Optional[str] = Field("google", max_length=50)
 
     @field_validator('nome')
     @classmethod
-    def sanitize_oauth_name(cls, v: str) -> str:
-        return security.sanitize_text(v) or v
+    def sanitize_oauth_name(cls, v: Optional[str]) -> Optional[str]:
+        return security.sanitize_text(v)
+
+    @field_validator('avatar_url')
+    @classmethod
+    def validate_oauth_avatar(cls, v: Optional[str]) -> Optional[str]:
+        return _validate_https_url(v)
 
 
 class AlterarSenhaRequest(BaseModel):
@@ -55,6 +73,11 @@ class UsuarioUpdate(BaseModel):
     def sanitize_update_name(cls, v: Optional[str]) -> Optional[str]:
         return security.sanitize_text(v)
 
+    @field_validator('avatar_url')
+    @classmethod
+    def validate_update_avatar(cls, v: Optional[str]) -> Optional[str]:
+        return _validate_https_url(v)
+
     @field_validator('status_recado')
     @classmethod
     def sanitize_update_recado(cls, v: Optional[str]) -> Optional[str]:
@@ -68,6 +91,14 @@ class UsuarioResponse(BaseModel):
     avatar_url: Optional[str] = None
     status_recado: Optional[str] = None
     criado_em: datetime
+
+class PerfilPublico(BaseModel):
+    """Perfil visível para outros usuários: sem e-mail."""
+    model_config = ConfigDict(from_attributes=True)
+    id: str
+    nome: str
+    avatar_url: Optional[str] = None
+    status_recado: Optional[str] = None
 
 class TokenResponse(BaseModel):
     access_token: str
@@ -88,8 +119,14 @@ class SsoExchangeRequest(BaseModel):
 # SCHEMAS DO ASTRALYS (PROJETOS & CÁLCULOS)
 # ==========================================
 
+def _check_project_size(v: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    if v is not None and len(json.dumps(v, ensure_ascii=False)) > MAX_PROJECT_JSON_BYTES:
+        raise ValueError("O projeto excede o tamanho máximo permitido (1 MB).")
+    return v
+
+
 class ProjetoCalculoCreate(BaseModel):
-    id: Optional[str] = None
+    id: Optional[str] = Field(None, max_length=36)
     nome: str = Field(..., min_length=1, max_length=255, description="Nome do projeto de cálculo")
     character_name: str = Field(..., min_length=1, max_length=100, description="Personagem principal")
     role: Optional[str] = Field("Main DPS", max_length=50)
@@ -108,6 +145,11 @@ class ProjetoCalculoCreate(BaseModel):
     def sanitize_char_nome(cls, v: str) -> str:
         return security.sanitize_text(v) or v
 
+    @field_validator('dados')
+    @classmethod
+    def limit_dados_size(cls, v: Dict[str, Any]) -> Dict[str, Any]:
+        return _check_project_size(v)
+
 class ProjetoCalculoUpdate(BaseModel):
     nome: Optional[str] = None
     character_name: Optional[str] = None
@@ -121,6 +163,11 @@ class ProjetoCalculoUpdate(BaseModel):
     @classmethod
     def sanitize_update_proj_nome(cls, v: Optional[str]) -> Optional[str]:
         return security.sanitize_text(v)
+
+    @field_validator('dados')
+    @classmethod
+    def limit_update_dados_size(cls, v: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        return _check_project_size(v)
 
 class ProjetoCalculoResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
@@ -136,5 +183,17 @@ class ProjetoCalculoResponse(BaseModel):
     criado_em: datetime
     atualizado_em: datetime
 
+class ProjetoResumo(BaseModel):
+    """Versão leve para listagens públicas: sem o JSON completo do projeto."""
+    model_config = ConfigDict(from_attributes=True)
+    id: str
+    nome: str
+    character_name: str
+    role: str
+    version: str
+    author: str
+    criado_em: datetime
+    atualizado_em: datetime
+
 class ProjetoSyncRequest(BaseModel):
-    projetos: List[ProjetoCalculoCreate]
+    projetos: List[ProjetoCalculoCreate] = Field(..., max_length=MAX_SYNC_ITEMS)

@@ -2,7 +2,7 @@ import os
 import uuid
 import time
 from collections import defaultdict
-from fastapi import FastAPI, Depends, HTTPException, status, Request, Response
+from fastapi import FastAPI, Depends, HTTPException, status, Request, Response, Query
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
@@ -35,10 +35,16 @@ class SlidingWindowRateLimiter:
     def is_allowed(self, ip: str, max_requests: int, window_seconds: int = 60) -> bool:
         now = time.time()
         # Filtra apenas requisições dentro da janela temporal
-        self.history[ip] = [t for t in self.history[ip] if now - t < window_seconds]
-        if len(self.history[ip]) >= max_requests:
+        recentes = [t for t in self.history[ip] if now - t < window_seconds]
+        if len(recentes) >= max_requests:
+            self.history[ip] = recentes
             return False
-        self.history[ip].append(now)
+        recentes.append(now)
+        self.history[ip] = recentes
+        # Descarta IPs inativos para o dicionário não crescer indefinidamente
+        if len(self.history) > 10_000:
+            for chave in [k for k, v in self.history.items() if not v or now - v[-1] >= window_seconds]:
+                self.history.pop(chave, None)
         return True
 
 auth_rate_limiter = SlidingWindowRateLimiter()
@@ -52,7 +58,7 @@ general_rate_limiter = SlidingWindowRateLimiter()
 async def security_and_rate_limit_middleware(request: Request, call_next):
     # Identifica IP real (considerando proxies do Render / Cloudflare)
     forwarded = request.headers.get("x-forwarded-for")
-    client_ip = forwarded.split(",")[0].strip() if forwarded else (request.client.host if request.client else "unknown")
+    client_ip = forwarded.split(",")[-1].strip() if forwarded else (request.client.host if request.client else "unknown")
 
     path = request.url.path
     method = request.method
@@ -96,7 +102,6 @@ async def security_and_rate_limit_middleware(request: Request, call_next):
 
 ALLOWED_ORIGINS = [
     "https://astralys.onrender.com",
-    "https://astralys-api.onrender.com",
     "https://ametist-tier-maker.vercel.app",
     "http://localhost:5173",
     "http://localhost:5174",
@@ -114,9 +119,9 @@ if env_origins:
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
-    allow_credentials=True,
+    allow_credentials=False,  # a autenticação é por header Bearer, não por cookie
     allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
-    allow_headers=["*"],
+    allow_headers=["Authorization", "Content-Type"],
 )
 
 security_scheme = HTTPBearer()
@@ -154,10 +159,11 @@ def get_current_user(
         models.SessaoAtiva.refresh_token_hash == token_hash
     ).first()
 
-    if sessao and sessao.revogado:
+    # A sessão precisa existir (um JWT válido sem sessão registrada não é aceito), não estar revogada nem expirada
+    if not sessao or sessao.revogado or sessao.expira_em < datetime.utcnow() or sessao.usuario_id != user_id:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Sessão revogada. Faça login novamente.",
+            detail="Sessão inválida, expirada ou revogada. Faça login novamente.",
             headers={"WWW-Authenticate": "Bearer"},
         )
 
@@ -165,8 +171,9 @@ def get_current_user(
     user = db.query(models.Usuario).filter(models.Usuario.id == user_id).first()
     if not user:
         raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
+            status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Usuário não encontrado.",
+            headers={"WWW-Authenticate": "Bearer"},
         )
     return user
 
@@ -238,6 +245,12 @@ def login(dados: schemas.LoginRequest, db: Session = Depends(get_db)):
 
     usuario.credencial.ultimo_login = datetime.utcnow()
 
+    # Limpeza de sessões expiradas ou revogadas deste usuário (evita crescimento infinito da tabela)
+    db.query(models.SessaoAtiva).filter(
+        models.SessaoAtiva.usuario_id == usuario.id,
+        (models.SessaoAtiva.expira_em < datetime.utcnow()) | (models.SessaoAtiva.revogado == True)
+    ).delete(synchronize_session=False)
+
     # Gera token JWT
     token = security.create_access_token(data={"sub": usuario.id, "email": usuario.email})
 
@@ -261,57 +274,60 @@ def login(dados: schemas.LoginRequest, db: Session = Depends(get_db)):
 
 
 @app.post("/auth/oauth-sync", response_model=schemas.TokenResponse, tags=["Autenticação"])
-def oauth_sync_login(dados: schemas.OAuthSyncRequest, db: Session = Depends(get_db)):
+def oauth_sync_login(
+        dados: schemas.OAuthSyncRequest,
+        credentials: HTTPAuthorizationCredentials = Depends(security_scheme),
+        db: Session = Depends(get_db)
+):
     """
-    Sincroniza e autentica usuários autenticados via OAuth (Google / Supabase):
-    - Cria a conta automaticamente caso seja o primeiro acesso com o Google.
-    - Se a conta já existir, sincroniza o nome e o avatar oficial do Google.
-    - Emite token JWT oficial do ecossistema e grava a sessão no banco para SSO unificado.
+    Sincroniza e autentica usuários que entraram via OAuth (Google / Supabase, usado pelo Ametist).
+    A identidade vem do access token do Supabase, verificado aqui com SUPABASE_JWT_SECRET;
+    o e-mail do corpo do pedido nunca é confiado. Sem SUPABASE_JWT_SECRET o endpoint fica desligado.
     """
-    usuario = db.query(models.Usuario).filter(models.Usuario.email == dados.email).first()
-    if not usuario:
-        usuario = models.Usuario(
-            email=dados.email,
-            nome=dados.nome or dados.email.split('@')[0],
-            avatar_url=dados.avatar_url
+    if not os.getenv("SUPABASE_JWT_SECRET", "").strip():
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Login federado não está configurado neste servidor."
         )
+
+    claims = security.verify_supabase_token(credentials.credentials)
+    if not claims:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Token do provedor inválido ou expirado.",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    email = str(claims["email"]).strip().lower()
+    meta = claims.get("user_metadata") or {}
+    nome = dados.nome or security.sanitize_text(meta.get("full_name") or meta.get("name")) or email.split("@")[0]
+    avatar_url = dados.avatar_url or meta.get("avatar_url")
+
+    usuario = db.query(models.Usuario).filter(models.Usuario.email == email).first()
+    if not usuario:
+        usuario = models.Usuario(email=email, nome=nome, avatar_url=avatar_url)
         db.add(usuario)
         db.flush()
 
-        # Cria credencial técnica para contas federadas
-        dummy_cred = models.Credencial(
+        # Credencial técnica aleatória para contas federadas (sem login por senha)
+        db.add(models.Credencial(
             usuario_id=usuario.id,
             senha_hash=security.hash_password(f"oauth_{uuid.uuid4().hex}!Aa1")
-        )
-        db.add(dummy_cred)
+        ))
         db.commit()
         db.refresh(usuario)
-    else:
-        # Atualiza avatar ou nome do perfil se recebido do Google
-        changed = False
-        if dados.avatar_url and not usuario.avatar_url:
-            usuario.avatar_url = dados.avatar_url
-            changed = True
-        if dados.nome and usuario.nome != dados.nome and len(dados.nome) > 1:
-            usuario.nome = dados.nome
-            changed = True
-        if changed:
-            db.commit()
-            db.refresh(usuario)
+    elif avatar_url and not usuario.avatar_url:
+        usuario.avatar_url = avatar_url
+        db.commit()
+        db.refresh(usuario)
 
-    # Gera token JWT com expiração e claims seguros
     token = security.create_access_token(data={"sub": usuario.id, "email": usuario.email})
-
-    # Registra a sessão ativa na tabela sessoes_ativas
-    token_hash = security.hash_token(token)
-    expira_em = datetime.utcnow() + timedelta(minutes=security.ACCESS_TOKEN_EXPIRE_MINUTES)
-    nova_sessao = models.SessaoAtiva(
+    db.add(models.SessaoAtiva(
         usuario_id=usuario.id,
-        refresh_token_hash=token_hash,
-        expira_em=expira_em,
+        refresh_token_hash=security.hash_token(token),
+        expira_em=datetime.utcnow() + timedelta(minutes=security.ACCESS_TOKEN_EXPIRE_MINUTES),
         revogado=False
-    )
-    db.add(nova_sessao)
+    ))
     db.commit()
 
     return {
@@ -319,7 +335,6 @@ def oauth_sync_login(dados: schemas.OAuthSyncRequest, db: Session = Depends(get_
         "token_type": "bearer",
         "usuario": usuario
     }
-
 
 
 @app.post("/auth/logout", response_model=schemas.MensagemResponse, tags=["Autenticação"])
@@ -358,16 +373,20 @@ def alterar_senha(
         )
 
     usuario_atual.credencial.senha_hash = security.hash_password(dados.nova_senha)
+
+    # Troca de senha invalida todas as sessões existentes (inclusive roubadas)
+    db.query(models.SessaoAtiva).filter(
+        models.SessaoAtiva.usuario_id == usuario_atual.id
+    ).update({"revogado": True}, synchronize_session=False)
     db.commit()
-    return {"mensagem": "Senha alterada com sucesso!"}
+    return {"mensagem": "Senha alterada com sucesso! Faça login novamente."}
 
 
 @app.post("/auth/recuperar-senha", response_model=schemas.MensagemResponse, tags=["Autenticação"])
 def solicitar_recuperacao_senha(email: str, db: Session = Depends(get_db)):
     """Simula a solicitação de recuperação de senha."""
-    usuario = db.query(models.Usuario).filter(models.Usuario.email == email).first()
-    # Por segurança, sempre devolvemos sucesso para não expor se o e-mail existe ou não
-    return {"mensagem": f"Se o e-mail {email} estiver cadastrado, as instruções de recuperação foram enviadas."}
+    # Ainda não envia e-mail. Resposta idêntica exista ou não a conta, para não expor cadastros.
+    return {"mensagem": "Se o e-mail estiver cadastrado, as instruções de recuperação foram enviadas."}
 
 
 # ==========================================
@@ -465,16 +484,25 @@ def excluir_minha_conta(
 
 
 # READ (Listar todos os perfis - para o serviço de chat)
-@app.get("/usuarios", response_model=List[schemas.UsuarioResponse], tags=["Perfis"])
-def listar_usuarios(db: Session = Depends(get_db)):
-    """Lista todos os usuários para exibição de contatos no chat."""
-    return db.query(models.Usuario).all()
+@app.get("/usuarios", response_model=List[schemas.PerfilPublico], tags=["Perfis"])
+def listar_usuarios(
+        limit: int = Query(50, ge=1, le=100),
+        offset: int = Query(0, ge=0),
+        usuario_atual: models.Usuario = Depends(get_current_user),
+        db: Session = Depends(get_db)
+):
+    """Lista perfis públicos (sem e-mail), paginado. Exige login."""
+    return db.query(models.Usuario).order_by(models.Usuario.nome).offset(offset).limit(limit).all()
 
 
 # READ (Buscar perfil por ID)
-@app.get("/usuarios/{usuario_id}", response_model=schemas.UsuarioResponse, tags=["Perfis"])
-def obter_usuario_por_id(usuario_id: str, db: Session = Depends(get_db)):
-    """Busca o perfil de um usuário específico pelo ID."""
+@app.get("/usuarios/{usuario_id}", response_model=schemas.PerfilPublico, tags=["Perfis"])
+def obter_usuario_por_id(
+        usuario_id: str,
+        usuario_atual: models.Usuario = Depends(get_current_user),
+        db: Session = Depends(get_db)
+):
+    """Busca o perfil público (sem e-mail) de um usuário. Exige login."""
     usuario = db.query(models.Usuario).filter(models.Usuario.id == usuario_id).first()
     if not usuario:
         raise HTTPException(
@@ -499,12 +527,16 @@ def listar_meus_projetos(
     ).order_by(models.ProjetoCalculo.atualizado_em.desc()).all()
 
 
-@app.get("/astralys/projetos/publicos", response_model=List[schemas.ProjetoCalculoResponse], tags=["Astralys - Projetos & Cálculos"])
-def listar_projetos_publicos(db: Session = Depends(get_db)):
-    """Lista projetos públicos compartilhados pela comunidade Astralys & Ametist."""
+@app.get("/astralys/projetos/publicos", response_model=List[schemas.ProjetoResumo], tags=["Astralys - Projetos & Cálculos"])
+def listar_projetos_publicos(
+        limit: int = Query(30, ge=1, le=100),
+        offset: int = Query(0, ge=0),
+        db: Session = Depends(get_db)
+):
+    """Lista resumos (sem o JSON completo) de projetos públicos, paginado. Use GET /{id} para o conteúdo."""
     return db.query(models.ProjetoCalculo).filter(
         models.ProjetoCalculo.is_public == True
-    ).order_by(models.ProjetoCalculo.atualizado_em.desc()).all()
+    ).order_by(models.ProjetoCalculo.atualizado_em.desc()).offset(offset).limit(limit).all()
 
 
 @app.get("/astralys/projetos/{projeto_id}", response_model=schemas.ProjetoCalculoResponse, tags=["Astralys - Projetos & Cálculos"])
@@ -543,16 +575,22 @@ def salvar_projeto(
     """Cria ou atualiza (upsert) uma planilha de cálculo para o usuário logado."""
     proj_id = dados.id or str(uuid.uuid4())
     projeto_existente = db.query(models.ProjetoCalculo).filter(
-        models.ProjetoCalculo.id == proj_id,
-        models.ProjetoCalculo.usuario_id == usuario_atual.id
+        models.ProjetoCalculo.id == proj_id
     ).first()
+
+    if projeto_existente and projeto_existente.usuario_id != usuario_atual.id:
+        # Não revela de quem é: o id simplesmente não está disponível
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Este identificador de projeto já está em uso. Gere um novo id."
+        )
 
     if projeto_existente:
         projeto_existente.nome = dados.nome
         projeto_existente.character_name = dados.character_name
         projeto_existente.role = dados.role or "Main DPS"
         projeto_existente.version = dados.version or "1.0"
-        projeto_existente.author = dados.author or usuario_atual.nome
+        projeto_existente.author = usuario_atual.nome
         projeto_existente.dados = dados.dados
         if dados.is_public is not None:
             projeto_existente.is_public = bool(dados.is_public)
@@ -568,7 +606,7 @@ def salvar_projeto(
         character_name=dados.character_name,
         role=dados.role or "Main DPS",
         version=dados.version or "1.0",
-        author=dados.author or usuario_atual.nome,
+        author=usuario_atual.nome,
         dados=dados.dados,
         is_public=bool(dados.is_public) if dados.is_public is not None else False,
         criado_em=datetime.utcnow(),
@@ -607,8 +645,6 @@ def atualizar_projeto(
         projeto.role = dados.role
     if dados.version is not None:
         projeto.version = dados.version
-    if dados.author is not None:
-        projeto.author = dados.author
     if dados.dados is not None:
         projeto.dados = dados.dados
     if dados.is_public is not None:
@@ -653,16 +689,18 @@ def sincronizar_projetos(
     for item in payload.projetos:
         proj_id = item.id or str(uuid.uuid4())
         existente = db.query(models.ProjetoCalculo).filter(
-            models.ProjetoCalculo.id == proj_id,
-            models.ProjetoCalculo.usuario_id == usuario_atual.id
+            models.ProjetoCalculo.id == proj_id
         ).first()
+
+        if existente and existente.usuario_id != usuario_atual.id:
+            continue  # id pertence a outro usuário: ignora este item em vez de derrubar o lote inteiro
 
         if existente:
             existente.nome = item.nome
             existente.character_name = item.character_name
             existente.role = item.role or existente.role
             existente.version = item.version or existente.version
-            existente.author = item.author or existente.author
+            existente.author = usuario_atual.nome
             existente.dados = item.dados
             if item.is_public is not None:
                 existente.is_public = bool(item.is_public)
@@ -675,7 +713,7 @@ def sincronizar_projetos(
                 character_name=item.character_name,
                 role=item.role or "Main DPS",
                 version=item.version or "1.0",
-                author=item.author or usuario_atual.nome,
+                author=usuario_atual.nome,
                 dados=item.dados,
                 is_public=bool(item.is_public) if item.is_public is not None else False,
                 criado_em=datetime.utcnow(),
