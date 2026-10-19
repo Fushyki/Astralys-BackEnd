@@ -227,3 +227,26 @@ def test_ip_forjado_no_inicio_do_xff_nao_contorna_o_limite(client):
                         headers={"X-Forwarded-For": f"10.0.0.{i}, 203.0.113.9"})
         codigos.append(r.status_code)
     assert 429 in codigos
+
+
+def test_link_publico_le_projeto_publico_sem_login_e_sem_ids_de_usuario(client):
+    token, perfil = criar_usuario(client, "Gabi", "gabi@exemplo.com")
+    pid = client.post("/astralys/projetos", headers=auth(token), json=_projeto(nome="Aberto", is_public=True)).json()["id"]
+    r = client.get(f"/astralys/publicos/{pid}")
+    assert r.status_code == 200
+    corpo = r.json()
+    assert corpo["nome"] == "Aberto"
+    assert corpo["author"] == perfil["nome"]
+    assert "dados" in corpo and "usuario_id" not in corpo and "is_public" not in corpo
+
+
+def test_link_publico_de_projeto_privado_ou_inexistente_da_404(client):
+    token, _ = criar_usuario(client, "Hugo", "hugo@exemplo.com")
+    pid = client.post("/astralys/projetos", headers=auth(token), json=_projeto(nome="Fechado")).json()["id"]
+    assert client.get(f"/astralys/publicos/{pid}").status_code == 404
+    assert client.get("/astralys/publicos/nao-existe").status_code == 404
+    # deixar de ser público fecha o link
+    client.put(f"/astralys/projetos/{pid}", headers=auth(token), json={"is_public": True})
+    assert client.get(f"/astralys/publicos/{pid}").status_code == 200
+    client.put(f"/astralys/projetos/{pid}", headers=auth(token), json={"is_public": False})
+    assert client.get(f"/astralys/publicos/{pid}").status_code == 404

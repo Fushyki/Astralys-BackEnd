@@ -183,6 +183,17 @@ class ProjetoCalculoResponse(BaseModel):
     criado_em: datetime
     atualizado_em: datetime
 
+class ProjetoPublico(BaseModel):
+    """O que o link público mostra: o projeto e o nome do autor, sem ids de usuário."""
+    model_config = ConfigDict(from_attributes=True)
+    id: str
+    nome: str
+    character_name: str
+    author: str
+    dados: Dict[str, Any]
+    atualizado_em: datetime
+
+
 class ProjetoResumo(BaseModel):
     """Versão leve para listagens públicas: sem o JSON completo do projeto."""
     model_config = ConfigDict(from_attributes=True)

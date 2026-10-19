@@ -539,6 +539,18 @@ def listar_projetos_publicos(
     ).order_by(models.ProjetoCalculo.atualizado_em.desc()).offset(offset).limit(limit).all()
 
 
+@app.get("/astralys/publicos/{projeto_id}", response_model=schemas.ProjetoPublico, tags=["Astralys - Projetos & Cálculos"])
+def obter_projeto_publico(projeto_id: str, db: Session = Depends(get_db)):
+    """Lê um projeto marcado como público, SEM login (link de compartilhamento). Privado ou inexistente: 404."""
+    projeto = db.query(models.ProjetoCalculo).filter(
+        models.ProjetoCalculo.id == projeto_id,
+        models.ProjetoCalculo.is_public == True
+    ).first()
+    if not projeto:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Projeto não encontrado ou não é público.")
+    return projeto
+
+
 @app.get("/astralys/projetos/{projeto_id}", response_model=schemas.ProjetoCalculoResponse, tags=["Astralys - Projetos & Cálculos"])
 def obter_projeto(
     projeto_id: str,
