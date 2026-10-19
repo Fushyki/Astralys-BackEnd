@@ -10,7 +10,9 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 
 if not DATABASE_URL:
     MYSQL_USER = os.getenv("MYSQL_USER", "root")
-    MYSQL_PASSWORD = os.getenv("MYSQL_PASSWORD", "1234")
+    MYSQL_PASSWORD = os.getenv("MYSQL_PASSWORD")
+    if not MYSQL_PASSWORD:
+        raise RuntimeError("Defina DATABASE_URL ou MYSQL_PASSWORD (sem senha padrão por segurança).")
     MYSQL_HOST = os.getenv("MYSQL_HOST", "localhost")
     MYSQL_PORT = os.getenv("MYSQL_PORT", "3306")
     MYSQL_DB = os.getenv("MYSQL_DB", "usuario")

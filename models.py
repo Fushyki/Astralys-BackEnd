@@ -34,7 +34,7 @@ class SessaoAtiva(Base):
 
     id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
     usuario_id = Column(String(36), ForeignKey("usuarios.id"), nullable=False)
-    refresh_token_hash = Column(String(255), nullable=False)
+    refresh_token_hash = Column(String(255), nullable=False, index=True)
     expira_em = Column(DateTime, nullable=False)
     revogado = Column(Boolean, default=False)
 
@@ -55,4 +55,4 @@ class ProjetoCalculo(Base):
     criado_em = Column(DateTime, default=datetime.utcnow)
     atualizado_em = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
-    usuario = relationship("Usuario", back_populates="projetos")
+    usuario = relationship("Usuario", back_populates="projetos")

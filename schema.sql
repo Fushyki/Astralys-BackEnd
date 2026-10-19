@@ -38,6 +38,7 @@ CREATE TABLE IF NOT EXISTS sessoes_ativas (
     refresh_token_hash VARCHAR(255) NOT NULL,
     expira_em DATETIME NOT NULL,
     revogado BOOLEAN DEFAULT FALSE,
+    INDEX ix_sessoes_ativas_refresh_token_hash (refresh_token_hash),
     CONSTRAINT fk_sessoes_usuario
         FOREIGN KEY (usuario_id) REFERENCES usuarios (id)
         ON DELETE CASCADE

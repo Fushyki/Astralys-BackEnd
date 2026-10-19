@@ -12,12 +12,32 @@ from typing import Optional
 # ==========================================
 # CONFIGURAÇÕES JWT E SEGREDOS CRIPTOGRÁFICOS
 # ==========================================
-SECRET_KEY = os.getenv("SECRET_KEY", "segredo-super-secreto-ms-identity")
+_INSECURE_SECRETS = {
+    "segredo-super-secreto-ms-identity",
+    "troque-por-um-segredo-longo-e-aleatorio",
+    "changeme",
+    "secret",
+}
+
+
+def _load_secret_key() -> str:
+    """Exige um SECRET_KEY forte vindo do ambiente; nunca arranca com um valor público/padrão."""
+    value = os.getenv("SECRET_KEY", "").strip()
+    if not value or value in _INSECURE_SECRETS or len(value) < 32:
+        raise RuntimeError(
+            "SECRET_KEY ausente ou fraca. Defina SECRET_KEY com pelo menos 32 caracteres aleatórios "
+            "(ex.: python -c \"import secrets; print(secrets.token_urlsafe(48))\")."
+        )
+    return value
+
+
+SECRET_KEY = _load_secret_key()
+JWT_ISSUER = "astralys-ametist-sso"
 ALGORITHM = os.getenv("ALGORITHM", "HS256")
 ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", 60 * 24))
 
 # Hash bcrypt pré-computado para mitigação de ataques de temporização (Timing Attacks)
-DUMMY_PASSWORD_HASH = "$2b$12$K89Igh6w6.wBq1Y6UvVb1uX/Xm8z4R0pM2U5bV3L1oX.y5L4n0o1r"
+DUMMY_PASSWORD_HASH = bcrypt.hashpw(b"dummy-password-for-timing", bcrypt.gensalt(rounds=12)).decode("utf-8")
 
 # Lista de senhas comuns/fracas proibidas pelo padrão NIST
 COMMON_WEAK_PASSWORDS = {
@@ -110,7 +130,7 @@ def create_access_token(data: dict, expires_delta: Optional[timedelta] = None) -
     to_encode.update({
         "exp": expire,
         "iat": datetime.now(timezone.utc),
-        "iss": "astralys-ametist-sso"
+        "iss": JWT_ISSUER
     })
     encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
     return encoded_jwt
@@ -123,6 +143,7 @@ def decode_access_token(token: str) -> Optional[dict]:
             token,
             SECRET_KEY,
             algorithms=[ALGORITHM],
+            issuer=JWT_ISSUER,
             options={"require": ["exp", "sub", "iat"]}
         )
         return payload
@@ -161,3 +182,27 @@ def consume_sso_ticket(ticket: str) -> Optional[str]:
     if data["expires_at"] < now:
         return None
     return data["user_id"]
+
+
+# ==========================================
+# VERIFICAÇÃO DE TOKENS OAUTH (SUPABASE)
+# ==========================================
+
+def verify_supabase_token(token: str) -> Optional[dict]:
+    """
+    Valida o access token emitido pelo Supabase (login Google do Ametist) com SUPABASE_JWT_SECRET.
+    Devolve as claims verificadas ou None. Sem SUPABASE_JWT_SECRET configurado, devolve None.
+    """
+    secret = os.getenv("SUPABASE_JWT_SECRET", "").strip()
+    if not secret:
+        return None
+    try:
+        return jwt.decode(
+            token,
+            secret,
+            algorithms=["HS256"],
+            audience="authenticated",
+            options={"require": ["exp", "sub", "email"]}
+        )
+    except jwt.PyJWTError:
+        return None
