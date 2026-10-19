@@ -2,7 +2,7 @@ import os
 import uuid
 import time
 from collections import defaultdict
-from fastapi import FastAPI, Depends, HTTPException, status, Request, Response, Query
+from fastapi import FastAPI, Depends, HTTPException, status, Request, Response, Query, Path
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
@@ -13,6 +13,7 @@ from database import engine, Base, get_db
 import models
 import schemas
 import security
+import enka
 
 # Garante que as tabelas existam no banco SQL
 Base.metadata.create_all(bind=engine)
@@ -188,6 +189,19 @@ def health_check():
         "status": "online",
         "service": "ms-identity"
     }
+
+
+# ==========================================
+# ENKA.NETWORK (importar builds pelo UID)
+# ==========================================
+
+@app.get("/enka/{uid}", tags=["Enka"])
+def vitrine_do_jogador(uid: str = Path(..., pattern=r"^\d{9,10}$", description="UID do jogador (9 ou 10 dígitos)")):
+    """Vitrine pública do jogador (personagens, armas, artefatos), vinda do Enka.Network, a mesma fonte do akasha.cv."""
+    try:
+        return enka.buscar(uid)
+    except enka.EnkaError as e:
+        raise HTTPException(status_code=e.status, detail=e.mensagem)
 
 
 # ==========================================
