@@ -250,3 +250,35 @@ def test_link_publico_de_projeto_privado_ou_inexistente_da_404(client):
     assert client.get(f"/astralys/publicos/{pid}").status_code == 200
     client.put(f"/astralys/projetos/{pid}", headers=auth(token), json={"is_public": False})
     assert client.get(f"/astralys/publicos/{pid}").status_code == 404
+
+
+def test_enka_valida_o_uid_e_traduz_erros(client, monkeypatch):
+    import enka
+
+    enka._cache.clear()
+    assert client.get("/enka/abc").status_code == 422
+    assert client.get("/enka/123").status_code == 422
+
+    def sem_jogador(uid):
+        raise enka.EnkaError(404, "Esse UID não existe no Enka.Network.")
+
+    monkeypatch.setattr(enka, "_baixar", sem_jogador)
+    r = client.get("/enka/618285856")
+    assert r.status_code == 404
+    assert "UID" in r.json()["detail"]
+
+
+def test_enka_devolve_os_dados_e_usa_cache(client, monkeypatch):
+    import enka
+
+    enka._cache.clear()
+    chamadas = []
+
+    def falso(uid):
+        chamadas.append(uid)
+        return {"uid": uid, "avatarInfoList": []}
+
+    monkeypatch.setattr(enka, "_baixar", falso)
+    assert client.get("/enka/618285856").json()["uid"] == "618285856"
+    assert client.get("/enka/618285856").status_code == 200
+    assert chamadas == ["618285856"]
