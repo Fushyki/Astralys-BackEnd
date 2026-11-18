@@ -208,3 +208,75 @@ class ProjetoResumo(BaseModel):
 
 class ProjetoSyncRequest(BaseModel):
     projetos: List[ProjetoCalculoCreate] = Field(..., max_length=MAX_SYNC_ITEMS)
+
+# ==========================================
+# TIMES PÚBLICOS (galeria da comunidade, sem conta)
+# ==========================================
+
+MAX_RESUMO_JSON_BYTES = 20_000
+
+
+def _limpa(v: str) -> str:
+    return "".join(c for c in v if c.isprintable()).strip()
+
+
+class TimePublicoCreate(BaseModel):
+    nome: str = Field(..., min_length=1, max_length=120)
+    author: Optional[str] = Field(None, max_length=40)
+    version: Optional[str] = Field("", max_length=20)
+    members: List[str] = Field(..., min_length=1, max_length=4)
+    resumo: Dict[str, Any]
+    dados: Dict[str, Any]
+
+    @field_validator('nome')
+    @classmethod
+    def nome_limpo(cls, v: str) -> str:
+        v = _limpa(v)
+        if not v:
+            raise ValueError("Dê um nome ao time.")
+        return v
+
+    @field_validator('author')
+    @classmethod
+    def autor_limpo(cls, v: Optional[str]) -> str:
+        return _limpa(v or "") or "Anônimo"
+
+    @field_validator('members')
+    @classmethod
+    def membros_limpos(cls, v: List[str]) -> List[str]:
+        v = [_limpa(m)[:100] for m in v]
+        if not all(v):
+            raise ValueError("Personagem inválido.")
+        return v
+
+    @field_validator('resumo')
+    @classmethod
+    def limita_resumo(cls, v: Dict[str, Any]) -> Dict[str, Any]:
+        if len(json.dumps(v, ensure_ascii=False)) > MAX_RESUMO_JSON_BYTES:
+            raise ValueError("Resumo do time grande demais.")
+        return v
+
+    @field_validator('dados')
+    @classmethod
+    def limita_dados(cls, v: Dict[str, Any]) -> Dict[str, Any]:
+        return _check_project_size(v)
+
+
+class TimePublicoCriado(BaseModel):
+    id: str
+    edit_token: str
+
+
+class TimePublicoResumo(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    id: str
+    nome: str
+    author: str
+    version: str
+    members: List[str]
+    resumo: Dict[str, Any]
+    criado_em: datetime
+
+
+class TimePublicoCompleto(TimePublicoResumo):
+    dados: Dict[str, Any]

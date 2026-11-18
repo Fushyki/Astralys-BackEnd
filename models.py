@@ -56,3 +56,19 @@ class ProjetoCalculo(Base):
     atualizado_em = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
     usuario = relationship("Usuario", back_populates="projetos")
+
+
+class TimePublico(Base):
+    """Time/rotação publicado SEM conta (galeria da comunidade). Quem publica recebe um token de edição, guardado aqui só como hash."""
+    __tablename__ = "astralys_times_publicos"
+
+    id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    nome = Column(String(120), nullable=False)
+    author = Column(String(40), nullable=False, default="Anônimo")
+    version = Column(String(20), default="")
+    members = Column(JSON, nullable=False)  # nomes dos personagens, na ordem do time (para a busca)
+    busca = Column(String(600), nullable=False, index=True)  # "|membro|membro| nome autor" sem acento e minúsculo, para LIKE
+    resumo = Column(JSON, nullable=False)   # números e sequência da rotação para o card (calculados pelo site)
+    dados = Column(JSON, nullable=False)    # projeto inteiro, para abrir uma cópia
+    edit_token_hash = Column(String(64), nullable=False)
+    criado_em = Column(DateTime, default=datetime.utcnow, index=True)
