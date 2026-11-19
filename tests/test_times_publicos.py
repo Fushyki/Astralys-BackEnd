@@ -21,6 +21,7 @@ def test_publica_sem_login_busca_le_e_remove(client):
     assert client.get("/times", params={"versao": "5.7"}).json() == []
     assert client.get(f"/times/{c['id']}").json()["dados"] == {"x": 1}
     assert "dados" not in client.get("/times").json()[0]
+    assert "edit_token" not in client.get("/times").text and "hash" not in client.get(f"/times/{c['id']}").text
     assert client.delete(f"/times/{c['id']}", headers={"X-Edit-Token": "errado"}).status_code == 403
     assert client.delete(f"/times/{c['id']}", headers={"X-Edit-Token": c["edit_token"]}).status_code == 200
     assert client.get(f"/times/{c['id']}").status_code == 404
