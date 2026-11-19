@@ -126,7 +126,7 @@ app.add_middleware(
     allow_origins=ALLOWED_ORIGINS,
     allow_credentials=False,  # a autenticação é por header Bearer, não por cookie
     allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
-    allow_headers=["Authorization", "Content-Type", "X-Edit-Token"],
+    allow_headers=["Authorization", "Content-Type", "X-Edit-Token", "X-Admin-Token"],
 )
 
 security_scheme = HTTPBearer()
@@ -816,13 +816,19 @@ def obter_time(time_id: str, db: Session = Depends(get_db)):
 
 
 @app.delete("/times/{time_id}", tags=["Times públicos"])
-def despublicar_time(time_id: str, x_edit_token: str = Header("", max_length=100), db: Session = Depends(get_db)):
-    """Remove o time da galeria; exige o token que foi devolvido na publicação."""
+def despublicar_time(
+    time_id: str, request: Request, x_edit_token: str = Header("", max_length=100), x_admin_token: str = Header("", max_length=200),
+    db: Session = Depends(get_db),
+):
+    """Remove o time da galeria: quem publicou (token de edição) ou o dono do site (ADMIN_TOKEN, só no servidor)."""
     time_ = db.query(models.TimePublico).filter(models.TimePublico.id == time_id).first()
     if not time_:
         raise HTTPException(status_code=404, detail="Time não encontrado.")
-    if not hmac.compare_digest(time_.edit_token_hash, hashlib.sha256(x_edit_token.encode()).hexdigest()):
-        raise HTTPException(status_code=403, detail="Só quem publicou este time pode removê-lo.")
+    admin = os.environ.get("ADMIN_TOKEN", "")
+    eh_admin = len(admin) >= 32 and hmac.compare_digest(admin.encode(), x_admin_token.encode())
+    eh_dono = hmac.compare_digest(time_.edit_token_hash, hashlib.sha256(x_edit_token.encode()).hexdigest())
+    if not (eh_admin or eh_dono):
+        raise HTTPException(status_code=403, detail="Só quem publicou este time ou o administrador pode removê-lo.")
     db.delete(time_)
     db.commit()
     return {"mensagem": "Time removido da galeria."}

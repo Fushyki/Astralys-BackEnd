@@ -36,3 +36,16 @@ def test_valida_entrada_e_limita_publicacoes(client):
         publicar(client)
     assert client.post("/times", json=TIME).status_code == 429
     main.publish_rate_limiter.history.clear()
+
+
+def test_admin_remove_qualquer_time_e_so_com_token_forte(client, monkeypatch):
+    c = publicar(client)
+    monkeypatch.setenv("ADMIN_TOKEN", "curto")
+    assert client.delete(f"/times/{c['id']}", headers={"X-Admin-Token": "curto"}).status_code == 403
+    forte = "a" * 40
+    monkeypatch.setenv("ADMIN_TOKEN", forte)
+    assert client.delete(f"/times/{c['id']}", headers={"X-Admin-Token": "b" * 40}).status_code == 403
+    assert client.delete(f"/times/{c['id']}", headers={"X-Admin-Token": forte}).status_code == 200
+    monkeypatch.delenv("ADMIN_TOKEN")
+    c2 = publicar(client)
+    assert client.delete(f"/times/{c2['id']}", headers={"X-Admin-Token": ""}).status_code == 403
