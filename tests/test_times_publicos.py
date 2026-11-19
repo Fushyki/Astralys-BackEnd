@@ -60,3 +60,12 @@ def test_erro_repetido_no_codigo_bloqueia(client, monkeypatch):
         assert client.delete(f"/times/{c['id']}", headers={"X-Admin-Token": "errado"}).status_code == 403
     assert client.delete(f"/times/{c['id']}", headers={"X-Admin-Token": "x" * 12}).status_code == 429
     main.admin_fail_limiter.history.clear()
+
+
+def test_verificar_admin(client, monkeypatch):
+    main.admin_fail_limiter.history.clear()
+    monkeypatch.setenv("ADMIN_TOKEN", "x" * 12)
+    assert client.get("/admin/verificar").status_code == 403
+    assert client.get("/admin/verificar", headers={"X-Admin-Token": "errado"}).status_code == 403
+    assert client.get("/admin/verificar", headers={"X-Admin-Token": "x" * 12}).json() == {"admin": True}
+    main.admin_fail_limiter.history.clear()

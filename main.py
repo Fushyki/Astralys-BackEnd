@@ -816,6 +816,27 @@ def obter_time(time_id: str, db: Session = Depends(get_db)):
     return time_
 
 
+def _eh_admin(request: Request, x_admin_token: str) -> bool:
+    """Confere o código do dono do site (ADMIN_TOKEN). 5 erros em uma hora bloqueiam o IP (429)."""
+    admin = os.environ.get("ADMIN_TOKEN", "")
+    ip = _client_ip(request)
+    agora = time.time()
+    if x_admin_token and len([t for t in admin_fail_limiter.history[ip] if agora - t < 3600]) >= 5:
+        raise HTTPException(status_code=429, detail="Muitas tentativas de código. Tente de novo mais tarde.")
+    ok = len(admin) >= 12 and hmac.compare_digest(admin.encode(), x_admin_token.encode())
+    if x_admin_token and not ok:
+        admin_fail_limiter.is_allowed(ip, max_requests=10**6, window_seconds=3600)  # só registra a falha
+    return ok
+
+
+@app.get("/admin/verificar", tags=["Times públicos"])
+def verificar_admin(request: Request, x_admin_token: str = Header("", max_length=200)):
+    """Diz se o código é o do dono do site (a tela mostra o selo ADM). Sem código ou errado: 403."""
+    if not _eh_admin(request, x_admin_token):
+        raise HTTPException(status_code=403, detail="Código inválido.")
+    return {"admin": True}
+
+
 @app.delete("/times/{time_id}", tags=["Times públicos"])
 def despublicar_time(
     time_id: str, request: Request, x_edit_token: str = Header("", max_length=100), x_admin_token: str = Header("", max_length=200),
@@ -825,14 +846,7 @@ def despublicar_time(
     time_ = db.query(models.TimePublico).filter(models.TimePublico.id == time_id).first()
     if not time_:
         raise HTTPException(status_code=404, detail="Time não encontrado.")
-    admin = os.environ.get("ADMIN_TOKEN", "")
-    ip = _client_ip(request)
-    # quem já errou o código 5 vezes na última hora fica bloqueado (barra tentativa e erro)
-    if x_admin_token and len(admin_fail_limiter.history[ip]) >= 5 and len([t for t in admin_fail_limiter.history[ip] if time.time() - t < 3600]) >= 5:
-        raise HTTPException(status_code=429, detail="Muitas tentativas de código. Tente de novo mais tarde.")
-    eh_admin = len(admin) >= 12 and hmac.compare_digest(admin.encode(), x_admin_token.encode())
-    if x_admin_token and not eh_admin:
-        admin_fail_limiter.is_allowed(ip, max_requests=10**6, window_seconds=3600)  # só registra a falha
+    eh_admin = _eh_admin(request, x_admin_token)
     eh_dono = hmac.compare_digest(time_.edit_token_hash, hashlib.sha256(x_edit_token.encode()).hexdigest())
     if not (eh_admin or eh_dono):
         raise HTTPException(status_code=403, detail="Só quem publicou este time ou o administrador pode removê-lo.")
