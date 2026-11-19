@@ -40,6 +40,7 @@ def test_valida_entrada_e_limita_publicacoes(client):
 
 def test_admin_remove_qualquer_time_e_so_com_token_forte(client, monkeypatch):
     c = publicar(client)
+    main.admin_fail_limiter.history.clear()
     monkeypatch.setenv("ADMIN_TOKEN", "curto")
     assert client.delete(f"/times/{c['id']}", headers={"X-Admin-Token": "curto"}).status_code == 403
     forte = "a" * 40
@@ -49,3 +50,13 @@ def test_admin_remove_qualquer_time_e_so_com_token_forte(client, monkeypatch):
     monkeypatch.delenv("ADMIN_TOKEN")
     c2 = publicar(client)
     assert client.delete(f"/times/{c2['id']}", headers={"X-Admin-Token": ""}).status_code == 403
+
+
+def test_erro_repetido_no_codigo_bloqueia(client, monkeypatch):
+    main.admin_fail_limiter.history.clear()
+    monkeypatch.setenv("ADMIN_TOKEN", "x" * 12)
+    c = publicar(client)
+    for _ in range(5):
+        assert client.delete(f"/times/{c['id']}", headers={"X-Admin-Token": "errado"}).status_code == 403
+    assert client.delete(f"/times/{c['id']}", headers={"X-Admin-Token": "x" * 12}).status_code == 429
+    main.admin_fail_limiter.history.clear()

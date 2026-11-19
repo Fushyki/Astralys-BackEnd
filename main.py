@@ -761,6 +761,7 @@ def sincronizar_projetos(
 # ==========================================
 
 publish_rate_limiter = SlidingWindowRateLimiter()
+admin_fail_limiter = SlidingWindowRateLimiter()
 
 
 def _fold(s: str) -> str:
@@ -825,7 +826,13 @@ def despublicar_time(
     if not time_:
         raise HTTPException(status_code=404, detail="Time não encontrado.")
     admin = os.environ.get("ADMIN_TOKEN", "")
-    eh_admin = len(admin) >= 32 and hmac.compare_digest(admin.encode(), x_admin_token.encode())
+    ip = _client_ip(request)
+    # quem já errou o código 5 vezes na última hora fica bloqueado (barra tentativa e erro)
+    if x_admin_token and len(admin_fail_limiter.history[ip]) >= 5 and len([t for t in admin_fail_limiter.history[ip] if time.time() - t < 3600]) >= 5:
+        raise HTTPException(status_code=429, detail="Muitas tentativas de código. Tente de novo mais tarde.")
+    eh_admin = len(admin) >= 12 and hmac.compare_digest(admin.encode(), x_admin_token.encode())
+    if x_admin_token and not eh_admin:
+        admin_fail_limiter.is_allowed(ip, max_requests=10**6, window_seconds=3600)  # só registra a falha
     eh_dono = hmac.compare_digest(time_.edit_token_hash, hashlib.sha256(x_edit_token.encode()).hexdigest())
     if not (eh_admin or eh_dono):
         raise HTTPException(status_code=403, detail="Só quem publicou este time ou o administrador pode removê-lo.")
