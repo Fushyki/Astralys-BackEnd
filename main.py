@@ -1,8 +1,12 @@
 import os
 import uuid
+import hashlib
+import hmac
+import secrets
+import unicodedata
 import time
 from collections import defaultdict
-from fastapi import FastAPI, Depends, HTTPException, status, Request, Response, Query, Path
+from fastapi import FastAPI, Depends, HTTPException, status, Request, Response, Query, Path, Header
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
@@ -122,7 +126,7 @@ app.add_middleware(
     allow_origins=ALLOWED_ORIGINS,
     allow_credentials=False,  # a autenticação é por header Bearer, não por cookie
     allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
-    allow_headers=["Authorization", "Content-Type"],
+    allow_headers=["Authorization", "Content-Type", "X-Edit-Token", "X-Admin-Token"],
 )
 
 security_scheme = HTTPBearer()
@@ -751,3 +755,87 @@ def sincronizar_projetos(
     return db.query(models.ProjetoCalculo).filter(
         models.ProjetoCalculo.usuario_id == usuario_atual.id
     ).order_by(models.ProjetoCalculo.atualizado_em.desc()).all()
+
+# ==========================================
+# TIMES PÚBLICOS DA COMUNIDADE (sem conta)
+# ==========================================
+
+publish_rate_limiter = SlidingWindowRateLimiter()
+admin_fail_limiter = SlidingWindowRateLimiter()
+
+
+def _fold(s: str) -> str:
+    return "".join(c for c in unicodedata.normalize("NFD", s) if unicodedata.category(c) != "Mn").lower()
+
+
+def _client_ip(request: Request) -> str:
+    forwarded = request.headers.get("x-forwarded-for")
+    return forwarded.split(",")[-1].strip() if forwarded else (request.client.host if request.client else "unknown")
+
+
+@app.post("/times", response_model=schemas.TimePublicoCriado, status_code=201, tags=["Times públicos"])
+def publicar_time(dados: schemas.TimePublicoCreate, request: Request, db: Session = Depends(get_db)):
+    """Publica um time na galeria SEM login. Devolve o id e um token que só quem publicou tem (para despublicar)."""
+    if not publish_rate_limiter.is_allowed(_client_ip(request), max_requests=10, window_seconds=3600):
+        raise HTTPException(status_code=429, detail="Você publicou muitos times em pouco tempo. Tente de novo mais tarde.")
+    token = secrets.token_urlsafe(24)
+    time_ = models.TimePublico(
+        nome=dados.nome, author=dados.author, version=dados.version or "", members=dados.members,
+        busca=("|" + "|".join(_fold(m) for m in dados.members) + "| " + _fold(dados.nome) + " " + _fold(dados.author))[:600],
+        resumo=dados.resumo, dados=dados.dados,
+        edit_token_hash=hashlib.sha256(token.encode()).hexdigest(),
+    )
+    db.add(time_)
+    db.commit()
+    return {"id": time_.id, "edit_token": token}
+
+
+@app.get("/times", response_model=List[schemas.TimePublicoResumo], tags=["Times públicos"])
+def listar_times(
+    q: str = Query("", max_length=60), personagem: str = Query("", max_length=100), versao: str = Query("", max_length=20),
+    limit: int = Query(24, ge=1, le=60), offset: int = Query(0, ge=0), db: Session = Depends(get_db),
+):
+    """Galeria: busca por texto (nome, autor, personagem), por personagem exato e por versão do jogo. Mais novos primeiro."""
+    def like(t: str) -> str:
+        return "%" + t.replace("\\", "\\\\").replace("%", "\%").replace("_", "\_") + "%"
+    query = db.query(models.TimePublico)
+    if q.strip():
+        query = query.filter(models.TimePublico.busca.like(like(_fold(q.strip())), escape="\\"))
+    if personagem.strip():
+        query = query.filter(models.TimePublico.busca.like(like("|" + _fold(personagem.strip()) + "|"), escape="\\"))
+    if versao.strip():
+        query = query.filter(models.TimePublico.version == versao.strip())
+    return query.order_by(models.TimePublico.criado_em.desc()).offset(offset).limit(limit).all()
+
+
+@app.get("/times/{time_id}", response_model=schemas.TimePublicoCompleto, tags=["Times públicos"])
+def obter_time(time_id: str, db: Session = Depends(get_db)):
+    time_ = db.query(models.TimePublico).filter(models.TimePublico.id == time_id).first()
+    if not time_:
+        raise HTTPException(status_code=404, detail="Time não encontrado. O link pode ter sido removido por quem o criou.")
+    return time_
+
+
+@app.delete("/times/{time_id}", tags=["Times públicos"])
+def despublicar_time(
+    time_id: str, request: Request, x_edit_token: str = Header("", max_length=100), x_admin_token: str = Header("", max_length=200),
+    db: Session = Depends(get_db),
+):
+    """Remove o time da galeria: quem publicou (token de edição) ou o dono do site (ADMIN_TOKEN, só no servidor)."""
+    time_ = db.query(models.TimePublico).filter(models.TimePublico.id == time_id).first()
+    if not time_:
+        raise HTTPException(status_code=404, detail="Time não encontrado.")
+    admin = os.environ.get("ADMIN_TOKEN", "")
+    ip = _client_ip(request)
+    # quem já errou o código 5 vezes na última hora fica bloqueado (barra tentativa e erro)
+    if x_admin_token and len(admin_fail_limiter.history[ip]) >= 5 and len([t for t in admin_fail_limiter.history[ip] if time.time() - t < 3600]) >= 5:
+        raise HTTPException(status_code=429, detail="Muitas tentativas de código. Tente de novo mais tarde.")
+    eh_admin = len(admin) >= 12 and hmac.compare_digest(admin.encode(), x_admin_token.encode())
+    if x_admin_token and not eh_admin:
+        admin_fail_limiter.is_allowed(ip, max_requests=10**6, window_seconds=3600)  # só registra a falha
+    eh_dono = hmac.compare_digest(time_.edit_token_hash, hashlib.sha256(x_edit_token.encode()).hexdigest())
+    if not (eh_admin or eh_dono):
+        raise HTTPException(status_code=403, detail="Só quem publicou este time ou o administrador pode removê-lo.")
+    db.delete(time_)
+    db.commit()
+    return {"mensagem": "Time removido da galeria."}
