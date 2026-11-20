@@ -39,7 +39,8 @@ if "render.com" in DATABASE_URL and "sslmode" not in DATABASE_URL:
 
 engine = create_engine(
     DATABASE_URL,
-    pool_recycle=3600
+    pool_recycle=3600,
+    pool_pre_ping=True  # bancos serverless (Neon) suspendem parados: testa a conexão antes de usar
 )
 
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
